@@ -1,174 +1,191 @@
-// police.js — wanted stars, police cars + foot cops, busts, heat decay.
-import { G } from './state.js';
-import { CFG } from './config.js';
-import { angLerp, clamp } from './utils.js';
-import { createCar } from './vehicles.js';
-import { sfx } from './audio.js';
+// Polisi & wanted — Vice Harbor.
+//
+// Wanted naik saat: menabrak pejalan kaki (+1), mencuri mobil di dekat
+// polisi (+1), menembak (+1). Wanted turun setelah 20 detik tanpa kejahatan,
+// lalu 1 level tiap 15 detik.
+// Polisi = mobil kind 'police' (driver 'police'): jumlah aktif = wanted
+// (maks 5), spawn di jalan dekat player, mengejar mobil player (setir ke
+// arah player, menabrak/ram). Kalau player jalan kaki dan polisi menyentuh
+// 3 detik -> busted.
+//
+// Konvensi heading: radian, 0 = +Z, bertambah berlawanan jarum jam dilihat
+// dari atas; vektor maju = (sin(heading), cos(heading)) di (x, z).
 
-let sceneRef = null, collidersRef = null;
-let decayTimer = 0, noNearTimer = 0, spawnTimer = 0;
+export const MAX_WANTED = 5;
+const WANTED_QUIET_SECONDS = 20; // tanpa kejahatan sebelum wanted mulai turun
+const WANTED_DECAY_SECONDS = 15; // tiap interval ini wanted turun 1
+const POLICE_SPEED = 24; // sedikit lebih lambat dari top speed player (26)
+const POLICE_ACCEL = 13;
+const RAM_DIST = 3.4; // jarak sentuh polisi-player
+const RAM_PUSH = 12; // unit/detik dorongan ram ke mobil player
+const BUSTED_SECONDS = 3; // lama sentuhan jalan kaki sebelum busted
+const SPAWN_MIN_DIST = 25;
+const SPAWN_MAX_DIST = 55;
 
-export function initPolice(scene, colliders) {
-  sceneRef = scene || sceneRef;
-  collidersRef = colliders || collidersRef;
+function clamp(value, min, max) {
+  return value < min ? min : value > max ? max : value;
 }
 
-export function addWanted(n) {
-  const before = G.wanted;
-  G.wanted = clamp(G.wanted + n, 0, 5);
-  if (G.wanted > 0 && before === 0) sfx('siren');
+function angleDiff(a, b) {
+  let d = a - b;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
 }
 
-export function clearWanted() { G.wanted = 0; }
-
-export function policeCount() { return G.police.length; }
-
-function makeFootCop(x, z) {
-  const g = new THREE.Group();
-  const mat = (c) => new THREE.MeshLambertMaterial({ color: c });
-  const legs = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.7, 0.2), mat(0x1a2a44));
-  legs.position.y = 0.35; g.add(legs);
-  const body = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.65, 0.28), mat(0x1a2a44));
-  body.position.y = 1.02; g.add(body);
-  const vest = new THREE.Mesh(new THREE.BoxGeometry(0.54, 0.3, 0.3), mat(0x2244aa));
-  vest.position.y = 1.1; g.add(vest);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.22, 10, 8), mat(0xe8b88a));
-  head.position.y = 1.62; g.add(head);
-  const cap = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.1, 0.4), mat(0x0d1526));
-  cap.position.y = 1.8; g.add(cap);
-  g.traverse((o) => { if (o.isMesh) o.castShadow = true; });
-  g.position.set(x, 0, z);
-  return g;
-}
-
-function spawnPoliceCar() {
-  if (!sceneRef) return;
-  const pp = G.player.pos;
-  const a = Math.random() * Math.PI * 2, r = 45 + Math.random() * 25;
-  const x = clamp(pp.x + Math.sin(a) * r, -230, 230);
-  const z = clamp(pp.z + Math.cos(a) * r, -230, 230);
-  let car = null;
-  try { car = createCar(sceneRef, 'police', x, z, Math.atan2(pp.x - x, pp.z - z), 0x1a2a44); } catch { car = null; }
-  if (!car) return;
-  if (!G.vehicles.includes(car)) G.vehicles.push(car);
-  G.police.push({ group: car.group, model: 'police', pos: car.pos, heading: car.heading, speed: 0, onFoot: false, bustTimer: 0, car });
-}
-
-function spawnFootCop() {
-  if (!sceneRef) return;
-  const pp = G.player.pos;
-  const a = Math.random() * Math.PI * 2, r = 12 + Math.random() * 10;
-  const group = makeFootCop(pp.x + Math.sin(a) * r, pp.z + Math.cos(a) * r);
-  sceneRef.add(group);
-  G.police.push({
-    group, model: 'police', pos: { x: group.position.x, z: group.position.z },
-    heading: 0, speed: 0, onFoot: true, bustTimer: 0, car: null,
-  });
-}
-
-function removeUnit(u) {
-  const i = G.police.indexOf(u);
-  if (i >= 0) G.police.splice(i, 1);
-  if (u.car) {
-    const vi = G.vehicles.indexOf(u.car);
-    if (vi >= 0) G.vehicles.splice(vi, 1);
-  }
-  if (sceneRef && u.group) sceneRef.remove(u.group);
-}
-
-export function updatePolice(dt) {
-  if (G.mode !== 'play') return;
-  const pp = G.player.pos;
-  const maxCars = Math.min(1 + G.wanted, 5);
-  const cars = G.police.filter((u) => !u.onFoot);
-  const cops = G.police.filter((u) => u.onFoot);
-
-  // Spawn: police cars up to the wanted cap; foot cops at 3+ stars (max 3).
-  spawnTimer -= dt;
-  if (G.wanted > 0 && spawnTimer <= 0) {
-    spawnTimer = 2.5;
-    if (cars.length < maxCars) spawnPoliceCar();
-    else if (G.wanted >= 3 && cops.length < 3) spawnFootCop();
-  }
-  if (G.wanted === 0 && G.police.length) {
-    // Heat gone: units drive off / walk away, despawn when far.
-    for (let i = G.police.length - 1; i >= 0; i--) {
-      const u = G.police[i];
-      const dx = u.pos.x - pp.x, dz = u.pos.z - pp.z;
-      if (dx * dx + dz * dz > 120 * 120) removeUnit(u);
+function roadPointNear(city, rng, player, minDist, maxDist) {
+  for (let tries = 0; tries < 12; tries += 1) {
+    let p = null;
+    if (city && typeof city.randomRoadPoint === 'function') {
+      p = city.randomRoadPoint(rng);
     }
-  }
-
-  let nearest = 1e9;
-  const onFoot = G.player.onFoot;
-  const playerStopped = !onFoot && Math.abs((G.player.vehicle && G.player.vehicle.speed) || 0) < 0.5;
-
-  for (let i = G.police.length - 1; i >= 0; i--) {
-    const u = G.police[i];
-    const dx = pp.x - u.pos.x, dz = pp.z - u.pos.z;
-    const d = Math.sqrt(dx * dx + dz * dz) || 1;
-    if (d < nearest) nearest = d;
-    const targetHeading = Math.atan2(dx, dz);
-
-    if (u.onFoot) {
-      // Foot cop chases on foot (run speed 5.5); busted if close for 2s.
-      u.heading = angLerp(u.heading, targetHeading, dt * 6);
-      const sp = G.wanted >= 3 ? 5.5 : 4.5;
-      u.speed = sp;
-      u.pos.x += Math.sin(u.heading) * sp * dt;
-      u.pos.z += Math.cos(u.heading) * sp * dt;
-      u.group.position.set(u.pos.x, 0, u.pos.z);
-      u.group.rotation.y = u.heading;
-      if (onFoot && d < 2.2) {
-        u.bustTimer += dt;
-        if (u.bustTimer >= 2) return doBusted();
-      } else u.bustTimer = 0;
-      if (d > 90) removeUnit(u);
-    } else {
-      // Police car: steer toward the player, ram speed scales with stars.
-      u.heading = angLerp(u.heading, targetHeading, dt * 2.2);
-      const maxSp = 20 + G.wanted * 3.5;
-      u.speed = Math.min(maxSp, u.speed + 16 * dt);
-      // Ram: slow down right on top of the player so it nudges, not tunnels.
-      if (d < 4) u.speed = Math.max(4, u.speed - 20 * dt);
-      u.pos.x += Math.sin(u.heading) * u.speed * dt;
-      u.pos.z += Math.cos(u.heading) * u.speed * dt;
-      if (u.car) { u.car.heading = u.heading; u.car.speed = u.speed; }
-      u.group.position.set(u.pos.x, 0, u.pos.z);
-      u.group.rotation.y = u.heading;
-      // Busted in a car: fully stopped with a police car adjacent for 3s.
-      if (!onFoot && playerStopped && d < 4) {
-        u.bustTimer += dt;
-        if (u.bustTimer >= 3) return doBusted();
-      } else u.bustTimer = 0;
-      if (d > 160) removeUnit(u);
+    if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.z)) {
+      p = { x: (rng() - 0.5) * 80, z: (rng() - 0.5) * 80 };
     }
+    const d = player ? Math.hypot(p.x - player.x, p.z - player.z) : 0;
+    if (d >= minDist && d <= maxDist) return { x: p.x, z: p.z };
   }
+  // Gagal dapat jarak ideal: pakai titik jalan apa pun, geser menjauh player.
+  if (city && typeof city.randomRoadPoint === 'function') {
+    const p = city.randomRoadPoint(rng);
+    if (p && Number.isFinite(p.x) && Number.isFinite(p.z)) return { x: p.x, z: p.z };
+  }
+  return { x: (player ? player.x : 0) + SPAWN_MIN_DIST, z: player ? player.z : 0 };
+}
 
-  // Wanted decay: no unit within 60m for 10s, then -1 star every 8s.
-  if (G.wanted > 0) {
-    if (nearest > 60) {
-      noNearTimer += dt;
-      if (noNearTimer >= 10) {
-        decayTimer += dt;
-        if (decayTimer >= 8) { decayTimer = 0; G.wanted = Math.max(0, G.wanted - 1); }
+/** Status pengendali polisi (tidak ada mobil saat wanted 0). */
+export function createPolice(city, rng) {
+  return { city: city || null, rng: rng || Math.random, nextId: 1000 };
+}
+
+/** Tambah wanted (maks 5) + catat waktu kejahatan terakhir. */
+export function addWanted(state, n) {
+  state.wanted = clamp((state.wanted || 0) + n, 0, MAX_WANTED);
+  state.lastCrimeAt = state.time;
+  state.wantedDropTimer = 0;
+  return state.wanted;
+}
+
+/** Turunkan wanted bila sudah lama tanpa kejahatan: 1 per 15 detik. */
+export function decayWanted(state, dt) {
+  if ((state.wanted || 0) <= 0) return;
+  if (state.time - (state.lastCrimeAt ?? -1000) < WANTED_QUIET_SECONDS) {
+    state.wantedDropTimer = 0;
+    return;
+  }
+  state.wantedDropTimer = (state.wantedDropTimer || 0) + dt;
+  while (state.wantedDropTimer >= WANTED_DECAY_SECONDS && state.wanted > 0) {
+    state.wanted -= 1;
+    state.wantedDropTimer -= WANTED_DECAY_SECONDS;
+  }
+}
+
+/** Spawn satu mobil polisi di jalan dekat player, masuk ke state.cars. */
+export function spawnPoliceCar(state, city, rng) {
+  const police = state.police || {};
+  const id = police.nextId !== undefined ? police.nextId : 1000;
+  if (state.police) state.police.nextId = id + 1;
+  const p = roadPointNear(city, rng, state.player, SPAWN_MIN_DIST, SPAWN_MAX_DIST);
+  const car = {
+    id, kind: 'police',
+    x: p.x, z: p.z,
+    heading: state.player ? Math.atan2(state.player.x - p.x, state.player.z - p.z) : 0,
+    speed: 6, color: '#2c3e50',
+    driver: 'police', parked: false, owned: false,
+    pauseTimer: 0, turnTimer: 0, targetSpeed: POLICE_SPEED,
+    stunTimer: 0, touchTimer: 0,
+  };
+  state.cars.push(car);
+  return car;
+}
+
+/** Paksa spawn n polisi dekat player (dipakai world.debug.spawnPoliceNear). */
+export function spawnPoliceNear(state, city, rng, n) {
+  const spawned = [];
+  for (let i = 0; i < n; i += 1) spawned.push(spawnPoliceCar(state, city, rng));
+  return spawned;
+}
+
+/** Mobil polisi aktif yang sekarang ada di state.cars. */
+export function policeCars(state) {
+  return (state.cars || []).filter((car) => car.driver === 'police');
+}
+
+/**
+ * Satu langkah polisi. Mengembalikan EVENT_BUSTED (4) saat player jalan kaki
+ * ditangkap, 0 bila tidak. Polisi mengejar: setir ke arah player, gas pol,
+ * dan menabrak (ram) mobil player saat bersentuhan.
+ */
+export function stepPolice(state, dt, city, rng) {
+  const random = rng || (state.police && state.police.rng) || state.rng || Math.random;
+  const town = city || (state.police && state.police.city) || state.city || null;
+  const wanted = state.wanted || 0;
+  const player = state.player;
+
+  // Samakan jumlah polisi aktif dengan wanted (maks 5).
+  let active = policeCars(state);
+  while (active.length < Math.min(wanted, MAX_WANTED)) {
+    spawnPoliceCar(state, town, random);
+    active = policeCars(state);
+  }
+  while (active.length > Math.min(wanted, MAX_WANTED)) {
+    // Wanted turun: polisi terjauh pergi duluan.
+    let farthest = active[0];
+    let farDist = -1;
+    for (const car of active) {
+      const d = player ? Math.hypot(car.x - player.x, car.z - player.z) : 0;
+      if (d > farDist) {
+        farDist = d;
+        farthest = car;
       }
-    } else { noNearTimer = 0; decayTimer = 0; }
-  } else { noNearTimer = 0; decayTimer = 0; }
-}
+    }
+    const idx = state.cars.indexOf(farthest);
+    if (idx >= 0) state.cars.splice(idx, 1);
+    active = policeCars(state);
+  }
 
-function doBusted() {
-  // Clear the scene's police, fine the player, respawn at the station corner.
-  for (let i = G.police.length - 1; i >= 0; i--) removeUnit(G.police[i]);
-  G.stats.busted++;
-  G.cash = Math.max(0, G.cash - 100);
-  G.wanted = 0;
-  if (G.player.vehicle) { G.player.vehicle.isPlayer = false; G.player.vehicle = null; }
-  G.player.onFoot = true;
-  G.player.speed = 0;
-  G.player.pos.x = -210; G.player.pos.z = -210; // police station corner
-  G.player.heading = Math.PI / 4;
-  G.health = 50;
-  G.mode = 'busted';
-  sfx('busted');
+  if (!player || state.gameOver) return 0;
+
+  let events = 0;
+  for (const car of policeCars(state)) {
+    if (car.stunTimer > 0) {
+      car.touchTimer = 0;
+      continue;
+    }
+    const dx = player.x - car.x;
+    const dz = player.z - car.z;
+    const dist = Math.hypot(dx, dz) || 0.001;
+    // Setir ke arah player (belok paling cepat 2.4 rad/detik).
+    const wantHeading = Math.atan2(dx, dz);
+    const turn = clamp(angleDiff(wantHeading, car.heading), -2.4 * dt, 2.4 * dt);
+    car.heading += turn;
+    // Gas: kejar, tapi jangan jauh lebih cepat dari mobil player.
+    const playerSpeed = player.onFoot ? 0 : Math.abs(player.speed || 0);
+    const target = Math.min(POLICE_SPEED, playerSpeed + 4);
+    if (car.speed < target) car.speed = Math.min(target, car.speed + POLICE_ACCEL * dt);
+    else if (car.speed > target) car.speed = Math.max(target, car.speed - 4 * dt);
+
+    if (dist < RAM_DIST) {
+      if (player.onFoot) {
+        // Sentuhan jalan kaki: tahan 3 detik -> busted.
+        car.touchTimer += dt;
+        if (car.touchTimer >= BUSTED_SECONDS) {
+          state.gameOver = 'busted';
+          return 4; // EVENT_BUSTED
+        }
+      } else if (player.car) {
+        // Ram mobil player: dorong + perlambat mobil player.
+        const pushX = dx / dist;
+        const pushZ = dz / dist;
+        player.car.x += pushX * RAM_PUSH * dt;
+        player.car.z += pushZ * RAM_PUSH * dt;
+        player.car.speed *= Math.max(0, 1 - 1.5 * dt);
+        car.speed *= Math.max(0, 1 - 1.0 * dt);
+        car.touchTimer = 0;
+      }
+    } else {
+      car.touchTimer = 0;
+    }
+  }
+  return events;
 }

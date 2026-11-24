@@ -1,197 +1,332 @@
-// missions.js — 6-mission story chain for Jay Carter in Coral Bay.
-import { G } from './state.js';
-import { addWanted } from './police.js';
-import { sfx } from './audio.js';
+// Vice Harbor — mission chain for Mara Quinn.
+//
+// Three jobs from Sal Bianchi, played in order. The module only talks to the
+// world through the shared contract: world.state (cash, wanted, player, cars,
+// mission, message, gameOver, rng), world.city.randomRoadPoint(rng) for
+// targets on a road, and world.step() advancing the simulation. It never
+// draws, never touches the DOM and never plays sound itself — update()
+// returns the EVENT_MISSION bit (2) when a stage is reached or a job is
+// done, 0 otherwise, so main.js can trigger the matching sound / save.
+//
+// world.state.mission always mirrors the active job:
+//   { id, name, stage, objective, target: { x, z } | null, timer }
+// and world.state.message carries Sal's latest line.
+//
+// update() accepts either update(dt) (main.js) or update(state, dt) (the
+// world.step missions hook) — both call shapes do the same thing.
 
-export const MISSIONS = [
+export const EVENT_MISSION = 2;
+
+const ARRIVE = 7; // metres (world units) that count as "reached the marker"
+
+function dist2(ax, az, bx, bz) {
+  const dx = ax - bx;
+  const dz = az - bz;
+  return Math.hypot(dx, dz);
+}
+
+/** A point on a road. Falls back to the given coords when the city has no helper yet. */
+function roadPoint(world, fallback) {
+  const city = world.city;
+  if (city && typeof city.randomRoadPoint === 'function') {
+    try {
+      // randomRoadPoint takes the world's seeded rng; without it the call throws.
+      const p = city.randomRoadPoint(world.state.rng || Math.random);
+      if (p && Number.isFinite(p.x) && Number.isFinite(p.z)) return { x: p.x, z: p.z };
+    } catch {
+      // A bad road helper must never break a mission: use the fallback.
+    }
+  }
+  return { x: fallback.x, z: fallback.z };
+}
+
+/** The car the player is sitting in, as an id (player.car may be an object or an id). */
+function playerCarId(player) {
+  if (!player || player.onFoot || player.car == null) return null;
+  return typeof player.car === 'object' ? player.car.id : player.car;
+}
+
+function nearestCar(state, wantSport) {
+  const cars = state.cars || [];
+  const player = state.player;
+  let best = null;
+  let bestD = Infinity;
+  for (const car of cars) {
+    if (!car || car.kind === 'police') continue;
+    if (car.owned) continue; // Mara's own car is not a steal target.
+    if (wantSport && car.kind !== 'sport') continue;
+    // Parked cars are stealable; a moving one with a driver is a chase, not a job.
+    if (car.driver) continue;
+    const d = dist2(player.x, player.z, car.x, car.z);
+    if (d < bestD) {
+      bestD = d;
+      best = car;
+    }
+  }
+  return best;
+}
+
+const DEFS = [
   {
-    id: 1, title: 'First Wheels', reward: 150,
-    brief: 'Mara needs a driver. Get to the marker and prove you can handle Coral Bay traffic.',
-    steps: [{ type: 'goto', x: 140, z: 60, r: 9, text: 'Drive to the marker downtown' }],
+    id: 'delivery',
+    name: 'First Delivery',
+    reward: 150,
+    brief: 'Pick up a package at the docks and drop it at the marina.',
+    pickupLine: "Sal: Pick up the package at the docks. Don't keep the client waiting.",
+    deliverLine: 'Sal: Package secured. Drop it at the marina — quick and quiet.',
+    doneLine: "Sal: Delivery made. $150 — you're officially on the payroll, Mara.",
   },
   {
-    id: 2, title: 'Cab Fare', reward: 250,
-    brief: 'A fare is waiting at the north docks. Pick them up, then drop them across town.',
-    steps: [
-      { type: 'pickup', x: -120, z: 140, r: 8, text: 'Pick up the passenger at the docks' },
-      { type: 'deliver', x: 180, z: -140, r: 9, text: 'Deliver the passenger across town' },
-    ],
+    id: 'hotwheels',
+    name: 'Hot Wheels',
+    reward: 300,
+    brief: 'Boost a sports car, then lose the heat or reach the hideout.',
+    stealLine: 'Sal: I need wheels. Boost that sports car — any color, no questions.',
+    escapeLine: "Sal: Cops are on you! Lose the heat or get to the hideout.",
+    doneLine: 'Sal: Sweet ride. $300. The boys will strip it by morning.',
   },
   {
-    id: 3, title: 'Boost the Comet', reward: 400,
-    brief: 'A Comet sport coupe is parked somewhere in the city. Steal one and bring it to the garage.',
-    steps: [
-      { type: 'steal', model: 'sport', text: 'Steal a Comet sport car' },
-      { type: 'deliver', x: 60, z: 180, r: 9, text: 'Deliver the Comet to the garage' },
-    ],
-  },
-  {
-    id: 4, title: 'Heat', reward: 500,
-    brief: 'Time to make a name. Draw the attention of the Coral Bay PD, then vanish.',
-    steps: [
-      { type: 'goto', x: 0, z: 0, r: 10, text: 'Get to Coral Plaza and draw heat (2 stars)' },
-      { type: 'lose', stars: 0, text: 'Lose the cops!' },
-    ],
-  },
-  {
-    id: 5, title: 'Rooftop Rumble', reward: 600,
-    brief: 'Rival crew cornered Mara on the east rooftops. Get there on foot and deal with all five.',
-    steps: [
-      { type: 'goto', x: -60, z: -120, r: 9, text: 'Get to the east rooftops on foot' },
-      { type: 'defeat', count: 5, text: 'Defeat the 5 attackers' },
-    ],
-  },
-  {
-    id: 6, title: 'The Big One', reward: 1500,
-    brief: 'The Coral Bay Reserve Bank. Grab the cash, outrun the response, and bring it to the hideout.',
-    steps: [
-      { type: 'drive', x: 200, z: 40, r: 9, text: 'Drive to the Reserve Bank' },
-      { type: 'pickup', x: 200, z: 40, r: 7, text: 'Grab the cash from the vault' },
-      { type: 'deliver', x: -200, z: 200, r: 9, text: 'Escape to the hideout' },
-    ],
+    id: 'heist',
+    name: 'Harbor Heist',
+    reward: 800,
+    brief: 'Grab the money bag at the harbor and run it to the hideout.',
+    grabLine: "Sal: The money bag is at the harbor. Grab it and don't stop running.",
+    escapeLine: 'Sal: You got the bag! Get to the hideout — the whole harbor is coming for you.',
+    doneLine: "Sal: $800! The harbor job is ours. You're a legend, Mara.",
   },
 ];
 
-let sceneRef = null, beacon = null, beaconRing = null;
+export function createMissions(world) {
+  const state = world.state;
+  let index = 0; // which DEFS entry is active next
+  let done = []; // ids of finished jobs, in order
+  let active = null; // { def, stage, target, timer, hideout, targetCarId }
 
-export function setMissionScene(scene) {
-  sceneRef = scene || sceneRef;
-  if (sceneRef && !beacon) {
-    beacon = new THREE.Mesh(
-      new THREE.CylinderGeometry(1.4, 1.4, 34, 12, 1, true),
-      new THREE.MeshBasicMaterial({ color: 0xffc93c, transparent: true, opacity: 0.35, side: THREE.DoubleSide, blending: THREE.AdditiveBlending, depthWrite: false })
-    );
-    beaconRing = new THREE.Mesh(
-      new THREE.RingGeometry(2.2, 3.4, 24),
-      new THREE.MeshBasicMaterial({ color: 0xffc93c, transparent: true, opacity: 0.8, side: THREE.DoubleSide, depthWrite: false })
-    );
-    beaconRing.rotation.x = -Math.PI / 2;
-    beacon.visible = false; beaconRing.visible = false;
-    sceneRef.add(beacon); sceneRef.add(beaconRing);
-  }
-}
-
-function stepMarker(step) {
-  if (!step || step.x == null || step.z == null) return null;
-  return { x: step.x, z: step.z };
-}
-
-function applyStep(m) {
-  const step = MISSIONS.find((x) => x.id === m.id).steps[m.stepIndex];
-  m.objective = step.text || step.type;
-  m.marker = stepMarker(step);
-  m.data.stepT = 0;
-  m.data.killsStart = G.stats.kills;
-  m.data.stolenStart = G.stats.carsStolen;
-  m.data.heatReached = false;
-  moveBeacon(m.marker);
-}
-
-export function startMission(id, scene) {
-  if (scene) setMissionScene(scene);
-  const def = MISSIONS.find((x) => x.id === id);
-  if (!def) return;
-  const m = {
-    id: def.id, title: def.title, objective: '', stepIndex: 0,
-    marker: null, data: { stepT: 0, killsStart: G.stats.kills, stolenStart: G.stats.carsStolen, heatReached: false },
-  };
-  G.mission = m;
-  applyStep(m);
-  G.flashToast = `Mission: ${def.title} — ${m.objective}`;
-  sfx('mission');
-}
-
-function moveBeacon(marker) {
-  if (!beacon) return;
-  const on = !!marker;
-  beacon.visible = on; beaconRing.visible = on;
-  if (on) {
-    beacon.position.set(marker.x, 17, marker.z);
-    beaconRing.position.set(marker.x, 0.15, marker.z);
-  }
-}
-
-export function missionMarkerPos() {
-  if (G.mission && G.mission.marker) return { x: G.mission.marker.x, z: G.mission.marker.z };
-  return null;
-}
-
-// Re-sync the beacon with the current mission marker (e.g. after shots.js overrides it).
-export function refreshBeacon() { moveBeacon(G.mission ? G.mission.marker : null); }
-
-function nearMarker(step) {
-  const p = G.player.pos;
-  const dx = p.x - step.x, dz = p.z - step.z;
-  return dx * dx + dz * dz < step.r * step.r;
-}
-
-function advanceStep(m) {
-  const def = MISSIONS.find((x) => x.id === m.id);
-  sfx('pickup');
-  m.stepIndex++;
-  if (m.stepIndex >= def.steps.length) return completeMission(m, def);
-  applyStep(m);
-  G.flashToast = m.objective;
-}
-
-function completeMission(m, def) {
-  G.cash += def.reward;
-  G.stats.missionsDone++;
-  G.flashToast = `Mission complete: ${def.title}  +$${def.reward.toLocaleString('en-US')}`;
-  if (typeof window !== 'undefined' && window.__cashPop) window.__cashPop(def.reward);
-  G.mission = null;
-  moveBeacon(null);
-  sfx('mission'); sfx('cash');
-}
-
-export function updateMissions(dt) {
-  // Beacon pulse (cheap, runs even between missions when hidden it is skipped).
-  if (beacon && beacon.visible) {
-    const t = performance.now() * 0.003;
-    beacon.material.opacity = 0.25 + Math.sin(t) * 0.12;
-    beacon.rotation.y = t * 0.5;
-    const s = 1 + Math.sin(t * 2) * 0.12;
-    beaconRing.scale.set(s, s, 1);
-  }
-  const m = G.mission;
-  if (!m || G.mode !== 'play') return;
-  const def = MISSIONS.find((x) => x.id === m.id);
-  if (!def) { G.mission = null; moveBeacon(null); return; }
-  const step = def.steps[m.stepIndex];
-  if (!step) { completeMission(m, def); return; }
-  m.data.stepT += dt;
-
-  switch (step.type) {
-    case 'goto':
-    case 'drive':
-    case 'deliver':
-      if (nearMarker(step)) advanceStep(m);
-      break;
-    case 'pickup':
-      if (nearMarker(step)) {
-        // The Big One: grabbing the vault cash trips the alarm — 3 stars.
-        if (m.id === 6 && m.stepIndex === 1) addWanted(3);
-        advanceStep(m);
+  function syncMission() {
+    if (!active) {
+      if (index >= DEFS.length) {
+        state.mission = {
+          id: 'done',
+          name: 'Free Roam',
+          stage: 'done',
+          objective: 'All jobs done — free roam.',
+          target: null,
+          timer: 0,
+        };
+      } else {
+        state.mission = null;
       }
-      break;
-    case 'steal': {
-      const v = G.player.vehicle;
-      if (G.stats.carsStolen > m.data.stolenStart && v && v.model === step.model) advanceStep(m);
-      else if (G.stats.carsStolen > m.data.stolenStart && !v) {
-        // Stole the right car then got out: still counts — no soft-lock.
-        advanceStep(m);
-      }
-      break;
+      return;
     }
-    case 'lose': {
-      if (G.wanted >= 2) m.data.heatReached = true;
-      if ((m.data.heatReached && G.wanted <= step.stars) || m.data.stepT > 120) advanceStep(m);
-      break;
-    }
-    case 'defeat':
-      if (G.stats.kills - m.data.killsStart >= step.count) advanceStep(m);
-      break;
-    default:
-      advanceStep(m);
+    const objective =
+      active.def.id === 'delivery'
+        ? active.stage === 'pickup'
+          ? active.def.pickupLine
+          : active.def.deliverLine
+        : active.def.id === 'hotwheels'
+          ? active.stage === 'steal'
+            ? active.def.stealLine
+            : active.def.escapeLine
+          : active.stage === 'grab'
+            ? active.def.grabLine
+            : active.def.escapeLine;
+    state.mission = {
+      id: active.def.id,
+      name: active.def.name,
+      stage: active.stage,
+      objective,
+      target: active.target ? { x: active.target.x, z: active.target.z } : null,
+      timer: active.timer,
+    };
   }
+
+  function startNext() {
+    const def = DEFS[index];
+    if (!def) return false;
+    if (def.id === 'delivery') {
+      active = {
+        def,
+        stage: 'pickup',
+        target: roadPoint(world, { x: -180, z: 120 }),
+        timer: 0,
+        hideout: null,
+        targetCarId: null,
+      };
+      state.message = def.pickupLine;
+    } else if (def.id === 'hotwheels') {
+      const car = nearestCar(state, true) || nearestCar(state, false);
+      active = {
+        def,
+        stage: 'steal',
+        target: car ? { x: car.x, z: car.z } : roadPoint(world, { x: 60, z: -40 }),
+        timer: 0,
+        hideout: roadPoint(world, { x: 200, z: 180 }),
+        targetCarId: car ? car.id : null,
+      };
+      state.message = def.stealLine;
+    } else {
+      active = {
+        def,
+        stage: 'grab',
+        target: roadPoint(world, { x: -180, z: -120 }),
+        timer: 0,
+        hideout: roadPoint(world, { x: 200, z: 180 }),
+        targetCarId: null,
+      };
+      state.message = def.grabLine;
+    }
+    syncMission();
+    return true;
+  }
+
+  function completeActive() {
+    const def = active.def;
+    state.cash = (state.cash || 0) + def.reward;
+    done.push(def.id);
+    state.missionDone = def.id;
+    state.message = def.doneLine;
+    active = null;
+    index += 1;
+    if (index >= DEFS.length) {
+      state.message = 'All jobs done — free roam';
+      syncMission();
+      return EVENT_MISSION;
+    }
+    startNext();
+    return EVENT_MISSION;
+  }
+
+  /**
+   * Advance the active job by dt seconds. Safe to call every frame: it starts
+   * the next job when none is active and does nothing once the chain is done
+   * or the game is over. Returns EVENT_MISSION (2) when a stage is reached
+   * or a job is done, 0 otherwise. Accepts update(dt) or update(state, dt).
+   */
+  function update(a, b) {
+    const dt = b !== undefined ? b : a;
+    if (state.gameOver) return 0;
+    // The world was reset under us (time rewound below the mission timer):
+    // drop the stale chain instead of resuming a job from a past life.
+    if (active && state.time < active.timer - 0.001) {
+      index = 0;
+      done = [];
+      active = null;
+      syncMission();
+    }
+    if (!active) {
+      if (index >= DEFS.length) return 0;
+      startNext();
+      return 0;
+    }
+    active.timer += dt;
+    const player = state.player;
+    const def = active.def;
+    // A marker is easier to hit from a car than on foot.
+    const arriveR = player.onFoot === false ? 10 : ARRIVE;
+
+    if (def.id === 'delivery') {
+      if (dist2(player.x, player.z, active.target.x, active.target.z) <= arriveR) {
+        if (active.stage === 'pickup') {
+          active.stage = 'deliver';
+          active.target = roadPoint(world, { x: 150, z: -120 });
+          state.message = def.deliverLine;
+          syncMission();
+          return EVENT_MISSION;
+        }
+        return completeActive();
+      }
+    } else if (def.id === 'hotwheels') {
+      if (active.stage === 'steal') {
+        // The target car may roll away or despawn: keep the marker glued to
+        // it, and re-pick a stealable car when it is gone for good.
+        const cars = state.cars || [];
+        let targetCar = cars.find((c) => c && c.id === active.targetCarId);
+        if (!targetCar) {
+          targetCar = nearestCar(state, true) || nearestCar(state, false);
+          if (targetCar) {
+            active.targetCarId = targetCar.id;
+            active.target = { x: targetCar.x, z: targetCar.z };
+          }
+        } else {
+          active.target = { x: targetCar.x, z: targetCar.z };
+        }
+        const inCar = playerCarId(player);
+        if (inCar !== null && (active.targetCarId === null || inCar === active.targetCarId)) {
+          active.stage = 'escape';
+          active.target = { ...active.hideout };
+          state.wanted = Math.max(state.wanted || 0, 2);
+          state.message = def.escapeLine;
+          syncMission();
+          return EVENT_MISSION;
+        }
+      } else if (state.wanted === 0 || dist2(player.x, player.z, active.target.x, active.target.z) <= arriveR) {
+        return completeActive();
+      }
+    } else if (def.id === 'heist') {
+      if (active.stage === 'grab') {
+        if (dist2(player.x, player.z, active.target.x, active.target.z) <= arriveR) {
+          active.stage = 'escape';
+          active.target = { ...active.hideout };
+          state.wanted = Math.max(state.wanted || 0, 3);
+          state.message = def.escapeLine;
+          syncMission();
+          return EVENT_MISSION;
+        }
+      } else if (dist2(player.x, player.z, active.target.x, active.target.z) <= arriveR || state.wanted === 0) {
+        return completeActive();
+      }
+    }
+    syncMission();
+    return 0;
+  }
+
+  function list() {
+    return DEFS.map((def, i) => ({
+      id: def.id,
+      name: def.name,
+      reward: def.reward,
+      brief: def.brief,
+      status: done.includes(def.id) ? 'done' : i === index ? 'active' : 'locked',
+    }));
+  }
+
+  function current() {
+    if (!active) return null;
+    return {
+      id: active.def.id,
+      name: active.def.name,
+      stage: active.stage,
+      objective: state.mission ? state.mission.objective : '',
+      target: active.target ? { x: active.target.x, z: active.target.z } : null,
+      timer: active.timer,
+      reward: active.def.reward,
+    };
+  }
+
+  /** Skip ahead so a loaded save resumes at the first unfinished job. */
+  function restore(completedCount) {
+    const n = Math.max(0, Math.min(DEFS.length, completedCount || 0));
+    done = DEFS.slice(0, n).map((d) => d.id);
+    if (n > 0) state.missionDone = done[done.length - 1];
+    index = n;
+    active = null;
+    syncMission();
+  }
+
+  /** Restore from a save object ({ missionDone }) — the last finished job's successor starts next. */
+  function restoreSave(save) {
+    if (!save || typeof save.missionDone !== 'string') return;
+    const n = DEFS.findIndex((d) => d.id === save.missionDone);
+    if (n >= 0) restore(n + 1);
+  }
+
+  /** Back to a fresh chain (call alongside world.reset() when starting over). */
+  function reset() {
+    index = 0;
+    done = [];
+    active = null;
+    state.mission = null;
+  }
+
+  return { update, list, current, restore, restoreSave, reset };
 }

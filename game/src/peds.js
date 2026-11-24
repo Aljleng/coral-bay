@@ -1,147 +1,188 @@
-// peds.js — pedestrians: walk sidewalks, idle, flee, get knocked down.
-import { G } from './state.js';
-import { CFG } from './config.js';
-import { mulberry32, rand, randi, pick, clamp } from './utils.js';
+// Pejalan kaki — Vice Harbor.
+//
+// Pejalan kaki berjalan pelan di trotoar, menghindar dari mobil yang
+// mendekat, lari (flee) saat ada kejahatan di dekatnya atau wanted naik,
+// dan jatuh (down) kalau dipukul/ditabrak lalu hilang setelah beberapa detik.
+//
+// Konvensi heading: radian, 0 = +Z, bertambah berlawanan jarum jam dilihat
+// dari atas; vektor maju = (sin(heading), cos(heading)) di (x, z).
+//
+// Bentuk pejalan kaki: { x, z, heading, speed, state, color, downTimer,
+//   timer, targetX, targetZ }.
+// state: 'walk' | 'flee' | 'down'.
 
-let sceneRef = null;
-const SHIRTS = [0xd94f3d, 0x3d7bd9, 0x3dd95e, 0xd9c23d, 0x9b3dd9, 0xe07ba8, 0x3dd9c6, 0xd97b3d, 0xeeeeee, 0x222831];
-const PANTS = [0x2b3a55, 0x333333, 0x5a4632, 0x1f4d2e, 0x6b6b6b];
-const SKINS = [0xe8b88a, 0xc98d64, 0x8a5a3b, 0xf0c8a0, 0x6e4423];
+const PED_COUNT = 14;
+const WALK_SPEED = 1.4;
+const FLEE_SPEED = 3.6;
+const DOWN_TIME = 4; // detik tergeletak sebelum hilang
+const AVOID_DIST = 7; // jarak mobil mulai dihindari
+const FLEE_DIST = 14; // jarak kejahatan/player yang memicu lari
 
-// Roads run on a 56-unit pitch (BLOCK 42 + ROAD 14), GRID 9 => centres -224..224.
-function roadCentres() {
-  const pitch = CFG.BLOCK + CFG.ROAD, half = ((CFG.GRID - 1) / 2) * pitch, out = [];
-  for (let i = 0; i < CFG.GRID; i++) out.push(-half + i * pitch);
-  return out;
+const SHIRT_PALETTE = [
+  '#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6',
+  '#1abc9c', '#ecf0f1', '#e67e22', '#fd79a8', '#636e72',
+];
+
+/** Ambil satu elemen acak. PERHATIAN urutan argumen: rng dulu, array kedua. */
+export function pick(rng, arr) {
+  return arr[Math.floor(rng() * arr.length)];
 }
 
-function makePedMesh(shirt, pants, skin) {
-  const g = new THREE.Group();
-  const mat = (c) => new THREE.MeshLambertMaterial({ color: c });
-  const legs = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.7, 0.2), mat(pants));
-  legs.position.y = 0.35; g.add(legs);
-  const body = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.65, 0.28), mat(shirt));
-  body.position.y = 1.02; g.add(body);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.22, 10, 8), mat(skin));
-  head.position.y = 1.62; g.add(head);
-  const hair = new THREE.Mesh(new THREE.SphereGeometry(0.23, 10, 6, 0, Math.PI * 2, 0, 1.2), mat(0x1a1a1a));
-  hair.position.y = 1.66; g.add(hair);
-  g.traverse((o) => { if (o.isMesh) o.castShadow = true; });
-  return g;
-}
-
-function sidewalkPos(rng) {
-  const roads = roadCentres(), half = ((CFG.GRID - 1) / 2) * (CFG.BLOCK + CFG.ROAD);
-  const alongRoad = rng() < 0.5; // walk along an x-road (vary z) or a z-road (vary x)
-  const c = pick(rng, roads);
-  const off = (CFG.ROAD / 2 + 2.5) * (rng() < 0.5 ? 1 : -1);
-  const along = (rng() * 2 - 1) * (half - 10);
-  if (alongRoad) return { x: along, z: c + off, heading: rng() < 0.5 ? 0 : Math.PI };
-  return { x: c + off, z: along, heading: rng() < 0.5 ? Math.PI / 2 : -Math.PI / 2 };
-}
-
-export function spawnPeds(scene, n, seed) {
-  sceneRef = scene || sceneRef;
-  if (!sceneRef) return;
-  const rng = mulberry32(seed == null ? (G.seed || 1337) : seed);
-  for (let i = 0; i < n; i++) {
-    const p = sidewalkPos(rng);
-    const shirt = pick(rng, SHIRTS), pants = pick(rng, PANTS), skin = pick(rng, SKINS);
-    const group = makePedMesh(shirt, pants, skin);
-    group.position.set(p.x, 0, p.z);
-    group.rotation.y = p.heading;
-    sceneRef.add(group);
-    G.peds.push({
-      group, pos: { x: p.x, z: p.z }, heading: p.heading,
-      speed: 0.8 + rng() * 1.2, state: 'walk', color: shirt,
-      idleT: 0, fleeT: 0, downT: 0, walkT: 2 + rng() * 6,
-    });
+function sidewalkPoint(city, rng) {
+  if (city && typeof city.randomSidewalkPoint === 'function') {
+    const p = city.randomSidewalkPoint(rng);
+    if (p && Number.isFinite(p.x) && Number.isFinite(p.z)) return { x: p.x, z: p.z, heading: p.heading };
   }
-}
-
-export function nearestPed(pos, r) {
-  let best = null, bd = r * r;
-  for (const p of G.peds) {
-    if (p.state === 'down') continue;
-    const dx = p.pos.x - pos.x, dz = p.pos.z - pos.z, d = dx * dx + dz * dz;
-    if (d < bd) { bd = d; best = p; }
+  if (city && typeof city.randomRoadPoint === 'function') {
+    const p = city.randomRoadPoint(rng);
+    if (p && Number.isFinite(p.x) && Number.isFinite(p.z)) {
+      return { x: p.x + 3.5, z: p.z + 3.5, heading: p.heading };
+    }
   }
-  return best;
+  return { x: (rng() - 0.5) * 60, z: (rng() - 0.5) * 60, heading: undefined };
 }
 
-export function scarePeds(pos, r) {
-  for (const p of G.peds) {
-    if (p.state === 'down') continue;
-    const dx = p.pos.x - pos.x, dz = p.pos.z - pos.z;
-    if (dx * dx + dz * dz < r * r) { p.state = 'flee'; p.fleeT = 3 + Math.random() * 3; }
+function blockedAt(city, x, z) {
+  // city.isBlocked(x, z, r) butuh radius eksplisit; cek bounds juga karena
+  // isBlocked kota tidak memeriksa batas peta.
+  if (city && city.bounds) {
+    const b = city.bounds;
+    if (Number.isFinite(b.minX) && (x < b.minX || x > b.maxX || z < b.minZ || z > b.maxZ)) return true;
   }
+  if (city && typeof city.isBlocked === 'function') return city.isBlocked(x, z, 0.5);
+  return false;
 }
 
-// A punch (or car hit) knocks a ped down; they lie still, then despawn.
-export function knockDownPed(ped) {
-  if (!ped || ped.state === 'down') return;
-  ped.state = 'down'; ped.downT = 6;
-  ped.group.rotation.x = -Math.PI / 2;
-  ped.group.position.y = 0.25;
+function makePed(city, rng) {
+  const p = sidewalkPoint(city, rng);
+  const target = sidewalkPoint(city, rng);
+  return {
+    x: p.x, z: p.z,
+    heading: Number.isFinite(p.heading) ? p.heading : Math.atan2(target.x - p.x, target.z - p.z),
+    speed: WALK_SPEED * (0.8 + rng() * 0.5),
+    state: 'walk',
+    color: pick(rng, SHIRT_PALETTE),
+    downTimer: 0, timer: 0,
+    targetX: target.x, targetZ: target.z,
+  };
 }
 
-function removePed(ped) {
-  const i = G.peds.indexOf(ped);
-  if (i >= 0) G.peds.splice(i, 1);
-  if (sceneRef) sceneRef.remove(ped.group);
+export function createPeds(city, rng) {
+  const peds = [];
+  for (let i = 0; i < PED_COUNT; i += 1) peds.push(makePed(city, rng));
+  return peds;
 }
 
-export function updatePeds(dt) {
-  if (!G.peds.length) return;
-  const pp = (G.player && G.player.pos) || { x: 0, z: 0 };
-  const pSpeed = Math.abs((G.player && G.player.speed) || 0);
-  const half = ((CFG.GRID - 1) / 2) * (CFG.BLOCK + CFG.ROAD) + 6;
-  for (let i = G.peds.length - 1; i >= 0; i--) {
-    const p = G.peds[i];
-    if (p.state === 'down') {
-      p.downT -= dt;
-      if (p.downT <= 0) removePed(p);
+/** Mobil terdekat dari pejalan kaki (dipakai untuk menghindar). */
+function nearestCar(ped, cars) {
+  let best = null;
+  let bestDist = Infinity;
+  for (const car of cars || []) {
+    if (car.driver === null && car.parked) continue;
+    const d = Math.hypot(car.x - ped.x, car.z - ped.z);
+    if (d < bestDist) {
+      bestDist = d;
+      best = car;
+    }
+  }
+  return best === null ? null : { car: best, dist: bestDist };
+}
+
+export function stepPeds(state, dt, city, rng) {
+  const peds = state.peds || [];
+  const cars = state.cars || [];
+  const player = state.player;
+  const random = rng || state.rng || Math.random;
+  // Kejahatan baru saja terjadi (pukulan/tembakan/tabrak) atau wanted > 0:
+  // pejalan kaki di sekitar panik.
+  const crimeRecent = state.time - (state.lastCrimeAt ?? -1000) < 6;
+  const panic = crimeRecent || (state.wanted || 0) > 0;
+
+  for (let i = peds.length - 1; i >= 0; i -= 1) {
+    const ped = peds[i];
+
+    if (ped.state === 'down') {
+      ped.downTimer -= dt;
+      if (ped.downTimer <= 0) peds.splice(i, 1);
       continue;
     }
-    // Flee: player close and fast, or in a car, or recently scared.
-    const dx = p.pos.x - pp.x, dz = p.pos.z - pp.z;
-    const d2 = dx * dx + dz * dz;
-    if (p.state !== 'flee' && d2 < 49 && (pSpeed > 8 || !(G.player && G.player.onFoot))) {
-      p.state = 'flee'; p.fleeT = 2.5;
+
+    // Tentukan apakah lari: panik + player/kejahatan cukup dekat.
+    const playerDist = player ? Math.hypot(player.x - ped.x, player.z - ped.z) : Infinity;
+    const near = nearestCar(ped, cars);
+    if (panic && playerDist < FLEE_DIST) {
+      ped.state = 'flee';
+    } else if (ped.state === 'flee' && !panic) {
+      ped.state = 'walk';
     }
-    if (p.state === 'flee') {
-      p.fleeT -= dt;
-      const d = Math.sqrt(d2) || 1;
-      p.heading = Math.atan2(dx / d, dz / d);
-      const s = p.speed * 2.6;
-      p.pos.x += Math.sin(p.heading) * s * dt;
-      p.pos.z += Math.cos(p.heading) * s * dt;
-      if (p.fleeT <= 0) p.state = 'walk';
-    } else if (p.state === 'idle') {
-      p.idleT -= dt;
-      if (p.idleT <= 0) { p.state = 'walk'; p.walkT = 3 + Math.random() * 6; }
+
+    let moveX = 0;
+    let moveZ = 0;
+    let speed = ped.speed;
+
+    if (ped.state === 'flee') {
+      // Lari menjauhi player.
+      speed = FLEE_SPEED;
+      const dx = ped.x - (player ? player.x : ped.x);
+      const dz = ped.z - (player ? player.z : ped.z);
+      const dist = Math.hypot(dx, dz) || 1;
+      moveX = dx / dist;
+      moveZ = dz / dist;
+      ped.heading = Math.atan2(moveX, moveZ);
     } else {
-      p.walkT -= dt;
-      if (p.walkT <= 0) {
-        p.state = 'idle'; p.idleT = 1 + Math.random() * 3;
+      // Jalan menuju target trotoar; sampai -> pilih target baru.
+      const dx = ped.targetX - ped.x;
+      const dz = ped.targetZ - ped.z;
+      const dist = Math.hypot(dx, dz);
+      if (dist < 1.5) {
+        const next = sidewalkPoint(city, random);
+        ped.targetX = next.x;
+        ped.targetZ = next.z;
       } else {
-        // Drift: keep walking the same heading; bounce off city edge.
-        p.pos.x += Math.sin(p.heading) * p.speed * dt;
-        p.pos.z += Math.cos(p.heading) * p.speed * dt;
-        if (Math.abs(p.pos.x) > half || Math.abs(p.pos.z) > half) p.heading += Math.PI;
+        moveX = dx / dist;
+        moveZ = dz / dist;
+        ped.heading = Math.atan2(moveX, moveZ);
+      }
+      // Menghindar: mobil mendekat dari depan -> geser menyamping.
+      if (near && near.dist < AVOID_DIST && Math.abs(near.car.speed) > 2) {
+        const carDx = ped.x - near.car.x;
+        const carDz = ped.z - near.car.z;
+        const carDist = Math.hypot(carDx, carDz) || 1;
+        // Arah menghindar tegak lurus arah mobil.
+        const side = (Math.sin(near.car.heading) * carDz - Math.cos(near.car.heading) * carDx) > 0 ? 1 : -1;
+        moveX += -Math.cos(near.car.heading) * side * 0.9 + (carDx / carDist) * 0.6;
+        moveZ += Math.sin(near.car.heading) * side * 0.9 + (carDz / carDist) * 0.6;
+        const len = Math.hypot(moveX, moveZ) || 1;
+        moveX /= len;
+        moveZ /= len;
+        ped.heading = Math.atan2(moveX, moveZ);
       }
     }
-    p.pos.x = clamp(p.pos.x, -half, half);
-    p.pos.z = clamp(p.pos.z, -half, half);
-    p.group.position.set(p.pos.x, 0, p.pos.z);
-    if (p.state !== 'down') p.group.rotation.y = p.heading;
-    // Walk bob.
-    if (p.state === 'walk' || p.state === 'flee') {
-      p.group.position.y = Math.abs(Math.sin(performance.now() * 0.008 + p.pos.x)) * 0.05;
+
+    const nx = ped.x + moveX * speed * dt;
+    const nz = ped.z + moveZ * speed * dt;
+    // Jangan masuk ke dalam bangunan: coba sumbu demi sumbu.
+    if (!blockedAt(city, nx, nz)) {
+      ped.x = nx;
+      ped.z = nz;
+    } else if (!blockedAt(city, nx, ped.z)) {
+      ped.x = nx;
+    } else if (!blockedAt(city, ped.x, nz)) {
+      ped.z = nz;
+    } else {
+      // Terjebak di dinding: pilih target baru.
+      const next = sidewalkPoint(city, random);
+      ped.targetX = next.x;
+      ped.targetZ = next.z;
     }
   }
-  // Top up the crowd if it thinned out (despawns only; never above CFG.PEDS).
-  if (G.peds.length < CFG.PEDS && sceneRef && G.mode === 'play' && Math.random() < dt * 0.2) {
-    spawnPeds(sceneRef, 1, (Math.random() * 1e9) | 0);
-  }
+}
+
+/** Tandai pejalan kaki jatuh (dipukul/ditabrak); kembali false bila sudah jatuh. */
+export function knockDown(ped) {
+  if (!ped || ped.state === 'down') return false;
+  ped.state = 'down';
+  ped.downTimer = DOWN_TIME;
+  ped.speed = 0;
+  return true;
 }

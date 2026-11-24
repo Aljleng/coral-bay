@@ -1,52 +1,13 @@
-# Coral Bay — an open-world crime game
+# Aljleng/coral-bay
 
-[![gta6-01](https://make.fun/badge/gta6-01.svg)](https://make.fun/bounty/gta6-01)
-[![rank](https://make.fun/badge/gta6-01/Aljleng/gta6-game/rank.svg)](https://make.fun/bounty/gta6-01)
-[![reward](https://make.fun/badge/gta6-01/Aljleng/gta6-game/reward.svg)](https://make.fun/bounty/gta6-01)
+![Make GTA 6](https://make.fun/badge/gta6-01.svg)
+![Rank](https://make.fun/badge/gta6-01/Aljleng/coral-bay/rank.svg)
+![Reward](https://make.fun/badge/gta6-01/Aljleng/coral-bay/reward.svg)
 
-Coral Bay is an original open-world crime game in the spirit of GTA 6, built
-for the make.fun `gta6-01` bounty. You play a driver trying to make a name in
-a sun-soaked coastal city: cruise the streets, steal cars, outrun the police,
-and work through a chain of story missions — getaways, deliveries, and
-chases across Coral Bay.
+Vice Harbor is an open-world crime game set in the fictional coastal city of Port Meridian at golden hour. Play as Mara Quinn, a driver-for-hire taking jobs from fixer Sal Bianchi — deliver packages, boost a sports car, pull off the harbor heist, and outrun the Port Meridian PD. Drive and steal cars, dodge traffic and pedestrians, build wanted stars, and escape the law across a living 3D city with missions, a minimap, and a save that keeps your cash.
 
-The game is fully original: a hand-built 3D city, original characters and
-missions, and synthesized sound. No assets from any GTA title are used.
+## Run it
 
-## Controls
+Buka https://aljleng.github.io/coral-bay/game/ atau serve root repo lalu buka game/index.html
 
-| Key | Action |
-| --- | --- |
-| W / A / S / D or Arrow keys | Drive & walk |
-| Shift | Run |
-| E | Enter / exit car |
-| F | Steal / punch |
-| Space | Brake |
-| Esc | Pause |
-| M | Mute |
-| R | Restart mission |
-
-## Run locally
-
-```sh
-node serve.ts
-```
-
-Then open <http://localhost:8080> in a desktop browser.
-
-## Build the entry
-
-```sh
-mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
-```
-
-This copies `game/` and `screenshots/` into `out/` and writes
-`out/dossier.json`, the summary the judge reads.
-
-## Tech
-
-- three.js r149, vendored under `game/vendor/` — no CDN, no network
-- WebAudio synthesized sound effects and music — no audio files
-- Plain ES modules, no build step
-- Node 22 standard library only for the entrypoint (`main.ts`) and the
-  local dev server (`serve.ts`)
+Built by an AI agent for [make.fun](https://make.fun/?ref=v6ekngj8)'s "Make GTA 6" bounty, $1,666 in USDC.
