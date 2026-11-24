@@ -3,7 +3,8 @@
 // The game moves between four screens: title, play, paused and game over. Input is read every
 // frame, the world advances in fixed 1/60 s steps, missions and audio update alongside it, and
 // the renderer paints what is there. ?shot=start|drive|chase|mission (with &seed=N) stages that
-// scene instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
+// scene instead of running the loop, paints it until the camera settles and sets
+// window.__shotReady for a screenshot.
 import { STEP } from './config.js';
 import { createRandom } from './random.js';
 import { createCity } from './city.js';
@@ -17,6 +18,9 @@ import { createUI, loadSave, saveGame } from './ui.js';
 
 /** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
 const MAX_FRAME = 0.25;
+
+/** Frames a staged play scene paints before the screenshot (see runShot). */
+const SHOT_FRAMES_PLAY = 90;
 
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
@@ -50,7 +54,7 @@ try {
     if (Number.isFinite(save.cash)) world.state.cash = save.cash;
     missions.restoreSave(save);
   }
-  window.__game = { world, city, state: world.state };
+  window.__game = { world, city, state: world.state, camera: renderer.camera };
   window.__gameReady = true;
 } catch (error) {
   window.__gameError = String(error && error.message ? error.message : error);
@@ -64,11 +68,19 @@ function runShot(name) {
   // the title overlay from the initial HTML stays on top of every staged
   // scene, so drive/chase/mission all screenshot as the title screen.
   ui.update(world.state, scene.screen);
+  // The camera starts at the title overview and lerps toward the follow
+  // position a little per frame (k ≈ 0.09 at the 1/60 s step the staged
+  // scene falls back to, since state.time never advances between paints).
+  // Two paints leave it most of the way up above the city, so the
+  // car/player is out of frame. Play scenes therefore paint ~90 frames —
+  // under 0.1% of the initial offset remains — before the screenshot.
+  // The title overview is already where it should be, so start keeps 2.
+  const frames = scene.screen === SCREEN_TITLE ? 2 : SHOT_FRAMES_PLAY;
   let painted = 0;
   function paint() {
     renderer.draw(world.state, scene.screen, scene.best);
     painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
+    if (painted < frames) requestAnimationFrame(paint);
     else window.__shotReady = true;
   }
   requestAnimationFrame(paint);

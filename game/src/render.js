@@ -467,5 +467,5 @@ export function createRenderer(canvas, city) {
     renderer.render(scene, camera);
   }
 
-  return { draw, setMode };
+  return { draw, setMode, camera };
 }
