@@ -43,6 +43,59 @@ function ensureInCar(world) {
 }
 
 /**
+ * Straight-line distance the car can travel on this heading before a
+ * building or the map edge (car nose included). Roads run on a grid, so
+ * only the four cardinal headings are worth testing.
+ */
+function clearRunAhead(city, x, z, heading) {
+  const fx = Math.sin(heading);
+  const fz = Math.cos(heading);
+  const bounds = city && city.bounds;
+  for (let d = 0; d <= 600; d += 4) {
+    const nx = x + fx * (d + 6);
+    const nz = z + fz * (d + 6);
+    if (bounds && (nx < bounds.minX || nx > bounds.maxX || nz < bounds.minZ || nz > bounds.maxZ)) return d;
+    if (city && typeof city.isBlocked === 'function' && city.isBlocked(nx, nz, 2)) return d;
+  }
+  return 600;
+}
+
+/**
+ * Face the player's car down the longest clear straight and return that
+ * run in units. A full-throttle run covers ~150 units in 6 s, and the
+ * staged car can start near a map edge, where a straight drive stalls
+ * against the bounds instead of driving (verified: speed 26 -> 0).
+ */
+function faceLongestRun(world) {
+  const car = world.state.player && world.state.player.car;
+  if (!car) return 0;
+  const city = world.city;
+  let bestHeading = car.heading;
+  let bestRun = -1;
+  for (const h of [0, Math.PI / 2, Math.PI, -Math.PI / 2]) {
+    const run = clearRunAhead(city, car.x, car.z, h);
+    if (run > bestRun) {
+      bestRun = run;
+      bestHeading = h;
+    }
+  }
+  car.heading = bestHeading;
+  world.state.player.heading = bestHeading;
+  return bestRun;
+}
+
+/** Nearest police car distance to the player (Infinity when none). */
+function nearestPolice(state) {
+  const p = state.player;
+  let min = Infinity;
+  for (const car of state.cars || []) {
+    if (!car || (car.kind !== 'police' && car.driver !== 'police')) continue;
+    min = Math.min(min, Math.hypot(car.x - p.x, car.z - p.z));
+  }
+  return min;
+}
+
+/**
  * Set `world` to the named scene (start, drive, chase or mission; any other
  * name is start) and return the screen to draw over it and the best score to
  * show (always 0: Vice Harbor scores in cash, not points).
@@ -53,18 +106,31 @@ export function stageShot(name, world) {
 
   if (name === 'drive') {
     ensureInCar(world);
-    stepFor(world, DRIVE_SECONDS, DRIVE);
+    // Face the longest clear straight and only drive as far as it allows,
+    // so the frame ends at top speed instead of stalled at the map edge.
+    const run = faceLongestRun(world);
+    const seconds = Math.min(DRIVE_SECONDS, Math.max(2.5, (run - 40) / 26));
+    stepFor(world, seconds, DRIVE);
     return { screen: SCREEN_PLAY, best: 0 };
   }
 
   if (name === 'chase') {
     ensureInCar(world);
+    faceLongestRun(world);
     if (typeof debug.setWanted === 'function') debug.setWanted(3);
     else if (world.state) world.state.wanted = 3;
     if (typeof debug.spawnPoliceNear === 'function') debug.spawnPoliceNear(3);
     // Straight-line escape at full throttle: any steering drifts the car
     // off the road into a building, where it stalls (verified in testing).
-    stepFor(world, CHASE_SECONDS, DRIVE);
+    // Freeze the frame the moment the pursuit closes in (police within
+    // 10 units, car still at speed): any longer and the ramming pins the
+    // car to a crawl; any shorter and no police car is in frame yet.
+    const maxSteps = Math.round(CHASE_SECONDS / STEP);
+    for (let index = 0; index < maxSteps; index += 1) {
+      world.step(STEP, DRIVE);
+      const speed = Math.abs(world.state.player.speed || 0);
+      if (speed >= 12 && nearestPolice(world.state) <= 10) break;
+    }
     return { screen: SCREEN_PLAY, best: 0 };
   }
 

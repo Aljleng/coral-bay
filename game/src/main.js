@@ -59,6 +59,11 @@ try {
 
 function runShot(name) {
   const scene = stageShot(name, world);
+  // Sync the DOM (title menu, HUD, minimap) through the same per-frame
+  // channel the live loop uses after Enter starts the game. Without this
+  // the title overlay from the initial HTML stays on top of every staged
+  // scene, so drive/chase/mission all screenshot as the title screen.
+  ui.update(world.state, scene.screen);
   let painted = 0;
   function paint() {
     renderer.draw(world.state, scene.screen, scene.best);
