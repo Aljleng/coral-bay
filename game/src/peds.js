@@ -33,7 +33,7 @@ function makePedMesh(shirt, pants, skin) {
 function sidewalkPos(rng) {
   const roads = roadCentres(), half = ((CFG.GRID - 1) / 2) * (CFG.BLOCK + CFG.ROAD);
   const alongRoad = rng() < 0.5; // walk along an x-road (vary z) or a z-road (vary x)
-  const c = pick(roads, rng);
+  const c = pick(rng, roads);
   const off = (CFG.ROAD / 2 + 2.5) * (rng() < 0.5 ? 1 : -1);
   const along = (rng() * 2 - 1) * (half - 10);
   if (alongRoad) return { x: along, z: c + off, heading: rng() < 0.5 ? 0 : Math.PI };
@@ -46,7 +46,7 @@ export function spawnPeds(scene, n, seed) {
   const rng = mulberry32(seed == null ? (G.seed || 1337) : seed);
   for (let i = 0; i < n; i++) {
     const p = sidewalkPos(rng);
-    const shirt = pick(SHIRTS, rng), pants = pick(PANTS, rng), skin = pick(SKINS, rng);
+    const shirt = pick(rng, SHIRTS), pants = pick(rng, PANTS), skin = pick(rng, SKINS);
     const group = makePedMesh(shirt, pants, skin);
     group.position.set(p.x, 0, p.z);
     group.rotation.y = p.heading;
